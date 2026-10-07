@@ -138,6 +138,8 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "migrate", "bridges"]:
+                    return self._send(200, service.migrate_legacy_bridges(actor))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

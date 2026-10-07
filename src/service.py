@@ -1,7 +1,8 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, InvalidTransition, NotFoundError
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -43,6 +44,8 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        if entity["kind"] == "qc_bridge" and action == "rollback":
+            return self._rollback_bridge(actor, entity, data or {}, expected_version)
         expected = int(expected_version) if expected_version is not None else entity["version"]
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
@@ -65,6 +68,90 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
+
+    def _return_batch(self, actor, batch, bridge):
+        now = utcnow()
+        patch = {
+            "returned_by": actor.user_id,
+            "returned_at": now,
+            "return_reason": "bridge rollback: new lot out of control",
+        }
+        merged = dict(batch["data"])
+        merged.update(patch)
+        updated = self.repository.update_entity(batch["id"], int(batch["version"]), "returned", merged)
+        self.audit.record(
+            batch["id"],
+            actor,
+            "rollback",
+            "released",
+            "returned",
+            {"bridge_id": bridge["id"], "cutoff_at": bridge["data"].get("cutoff_at")},
+        )
+        return updated
+
+    def _rollback_bridge(self, actor, bridge, data, expected_version):
+        self.rules._ensure_role(actor, ("supervisor", "admin"))
+        if bridge["status"] not in ("confirmed", "stopped"):
+            raise InvalidTransition("cannot rollback bridge from status %s" % bridge["status"])
+        cutoff = str(bridge["data"].get("cutoff_at") or bridge["data"].get("valid_from") or "")
+        candidates = [
+            batch
+            for batch in self.repository.find_entities("result_batch", "bridge_id", bridge["id"])
+            if batch["status"] == "released" and str(batch["data"].get("run_at", "")) > cutoff
+        ]
+        rolled_back = []
+        skipped = []
+        for batch in candidates:
+            try:
+                self._return_batch(actor, batch, bridge)
+                rolled_back.append(batch["id"])
+            except ConflictError:
+                fresh = self.repository.get_entity(batch["id"])
+                if fresh and fresh["status"] == "released":
+                    self._return_batch(actor, fresh, bridge)
+                    rolled_back.append(batch["id"])
+                else:
+                    skipped.append(batch["id"])
+        expected = int(expected_version) if expected_version is not None else bridge["version"]
+        patch = {
+            "stopped_by": actor.user_id,
+            "stopped_at": utcnow(),
+            "stop_reason": data.get("reason") or "new lot out of control",
+        }
+        merged = dict(bridge["data"])
+        merged.update(patch)
+        updated = self.repository.update_entity(bridge["id"], expected, "stopped", merged)
+        self.audit.record(
+            bridge["id"],
+            actor,
+            "rollback",
+            bridge["status"],
+            "stopped",
+            {"cutoff_at": cutoff, "rolled_back": rolled_back, "skipped": skipped},
+        )
+        return updated
+
+    def migrate_legacy_bridges(self, actor):
+        self.rules._ensure_role(actor, ("supervisor", "admin"))
+        batches = self.repository.list_entities(kind="result_batch", status="released")
+        migrated = []
+        for batch in batches:
+            if batch["data"].get("bridge_id"):
+                continue
+            patch = {"migration_reason": "legacy result batch without bridge key"}
+            merged = dict(batch["data"])
+            merged.update(patch)
+            self.repository.update_entity(batch["id"], int(batch["version"]), "pending_bridge", merged)
+            self.audit.record(
+                batch["id"],
+                actor,
+                "migrate_bridge",
+                "released",
+                "pending_bridge",
+                {"reason": "legacy result batch without bridge key"},
+            )
+            migrated.append(batch["id"])
+        return {"migrated": migrated, "count": len(migrated)}
 
     def list(self, kind=None, status=None):
         if kind:

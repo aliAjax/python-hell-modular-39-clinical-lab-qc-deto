@@ -54,6 +54,9 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_bridge_key
+                    ON entities(json_extract(data, '$.bridge_key'))
+                    WHERE kind = 'qc_bridge';
             """)
 
     @staticmethod

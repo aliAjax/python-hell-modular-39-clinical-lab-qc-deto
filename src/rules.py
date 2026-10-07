@@ -1,4 +1,14 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _find_one(lookup, kind, field, value):
@@ -165,7 +175,35 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
-    return {"released_by": actor.user_id}
+    patch = {"released_by": actor.user_id}
+    bridge = _find_one(
+        lookup,
+        "qc_bridge",
+        "bridge_key",
+        _bridge_key(instrument["id"], assay_id=entity["data"].get("assay_id"), lot_id=run["data"].get("qc_lot_id")),
+    )
+    if bridge:
+        if bridge["status"] == "stopped":
+            raise ConflictError("bridge is stopped; release is blocked")
+        if bridge["status"] == "revoked":
+            raise ConflictError("bridge is revoked")
+        if bridge["status"] != "confirmed":
+            raise ConflictError("bridge is not confirmed")
+        if _bridge_expired(bridge):
+            raise ConflictError("bridge has expired; reconfirm before release")
+        patch["bridge_id"] = bridge["id"]
+        patch["released_under_bridge"] = True
+        patch["borrowed_lot_id"] = bridge["data"].get("borrowed_lot_id")
+    return patch
+
+
+def _bridge_key(instrument_id, assay_id, lot_id):
+    return "%s:%s:%s" % (instrument_id, assay_id, lot_id)
+
+
+def _bridge_expired(bridge, today=None):
+    today = today or _today()
+    return str(bridge["data"].get("valid_until", ""))[:10] < str(today)[:10]
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -194,6 +232,61 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_bridge_create(actor, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    lot = _find_one(lookup, "qc_lot", "id", data.get("qc_lot_id"))
+    borrowed = _find_one(lookup, "qc_lot", "id", data.get("borrowed_lot_id"))
+    if not instrument or not assay or not lot or not borrowed:
+        raise ValidationError("instrument, assay, qc_lot and borrowed_lot are required")
+    if lot["data"].get("assay_id") != assay["id"]:
+        raise ValidationError("qc lot does not belong to the assay")
+    if borrowed["data"].get("assay_id") != assay["id"]:
+        raise ValidationError("borrowed lot does not belong to the assay")
+    if lot["id"] == borrowed["id"]:
+        raise ValidationError("bridged lot and borrowed lot must differ")
+    valid_until = data.get("valid_until")
+    if not valid_until:
+        raise ValidationError("valid_until is required")
+    try:
+        target = float(borrowed["data"].get("target"))
+        sd = float(borrowed["data"].get("sd"))
+    except (TypeError, ValueError):
+        raise ValidationError("borrowed lot target and sd must be numeric")
+    bridge_key = _bridge_key(instrument["id"], assay["id"], lot["id"])
+    if _find_one(lookup, "qc_bridge", "bridge_key", bridge_key):
+        raise ConflictError("bridge already exists for instrument, assay and lot")
+    now = utcnow()
+    return {
+        "bridge_key": bridge_key,
+        "target": target,
+        "sd": sd,
+        "valid_from": data.get("valid_from") or now,
+        "cutoff_at": data.get("cutoff_at") or data.get("valid_from") or now,
+    }
+
+
+def _validate_bridge_confirm(actor, entity, data, lookup):
+    if _bridge_expired(entity):
+        raise ConflictError("bridge has expired; reconfirm with a new valid_until")
+    return {"confirmed_by": actor.user_id, "confirmed_at": utcnow()}
+
+
+def _validate_bridge_reconfirm(actor, entity, data, lookup):
+    valid_until = data.get("valid_until")
+    if not valid_until:
+        raise ValidationError("valid_until is required to reconfirm")
+    if str(valid_until)[:10] <= _today():
+        raise ValidationError("valid_until must be in the future")
+    now = utcnow()
+    return {
+        "valid_until": valid_until,
+        "cutoff_at": data.get("cutoff_at") or now,
+        "reconfirmed_by": actor.user_id,
+        "reconfirmed_at": now,
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +294,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "qc_bridges": "qc_bridge",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +302,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "qc_bridge": "pending",
     }
     TRANSITIONS = {
         "assay": {
@@ -239,7 +334,13 @@ class RuleEngine:
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
-            "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+            "correct": (("waiting", "intercepted", "investigating", "released", "resolved", "returned"), "waiting"),
+        },
+        "qc_bridge": {
+            "confirm": (("pending",), "confirmed"),
+            "expire": (("confirmed",), "expired"),
+            "reconfirm": (("expired", "stopped"), "confirmed"),
+            "revoke": (("pending", "confirmed", "expired"), "revoked"),
         },
     }
     CREATE_REQUIRED = {
@@ -248,6 +349,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "qc_bridge": ("instrument_id", "assay_id", "qc_lot_id", "borrowed_lot_id", "valid_until"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -268,6 +370,9 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("qc_bridge", "expire"): ("reason",),
+        ("qc_bridge", "reconfirm"): ("valid_until",),
+        ("qc_bridge", "revoke"): ("reason",),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -275,6 +380,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "qc_bridge": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +398,10 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "confirm": ("supervisor", "admin"),
+        "expire": ("supervisor", "admin"),
+        "reconfirm": ("supervisor", "admin"),
+        "revoke": ("admin",),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +409,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "qc_bridge": _validate_bridge_create,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
@@ -307,6 +418,8 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("qc_bridge", "confirm"): _validate_bridge_confirm,
+        ("qc_bridge", "reconfirm"): _validate_bridge_reconfirm,
     }
 
     def normalize_kind(self, kind):
