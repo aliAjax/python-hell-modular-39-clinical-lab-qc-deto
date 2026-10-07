@@ -149,6 +149,8 @@ def create_handler(service, rules, static_dir):
                             self.headers.get("Idempotency-Key"),
                         ),
                     )
+                if parts == ["api", "system", "upgrade-legacy-batches"]:
+                    return self._send(200, service.upgrade_legacy_batches(actor))
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)
